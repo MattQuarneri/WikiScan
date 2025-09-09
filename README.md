@@ -1,11 +1,13 @@
-# WikiScan
+# 🌐 WikiScan 🔍
 
-WikiScan is a fast, lightweight tool for indexing and searching Wikipedia dump files directly, without needing to fully decompress or import them. It supports interactive search, keyword-based indexing, and can be used both locally and over the network.
+WikiScan is a fast and lightweight tool for indexing and searching Wikipedia dump files directly, without needing to fully decompress or import them.
+It supports interactive keyword-based indexing, filter the indexs, search the articles in the index, and extracting the page text (either raw, plain, or json).
+The app's CLI can be used accessed locally via a local or network (websocket) terminal.
 
 ## Features
 
 - **Direct Wikipedia dump search**: Scan and search `.xml.bz2` Wikipedia dumps for article titles and keywords without full extraction.
-- **Interactive REPL**: Start a session to build indexes, search, and explore articles with commands like `s=`, `i=`, `show`, `back`, and more.
+- **Interactive REPL**: Start a session to build indexes, search, and explore articles with commands like `filter=`, `sarch=`, `show`, `back`, and more.
 - **Keyword indexing**: Build in-memory or persistent indexes for fast repeated searches. Save/load index files for later use.
 - **Network terminal support**: Expose the REPL over TCP using built-in server mode (`--tcp :PORT`) or external tools like `socat`/`ncat` for remote access.
 - **Minimal dependencies**: No database required; works directly on compressed dumps using efficient streaming and indexing.
