@@ -1,3 +1,5 @@
+// Developed by Matthew Quarneri 2025 (matt@mentic.com)
+
 use anyhow::{bail, Context, Result};
 use bzip2::read::{BzDecoder, MultiBzDecoder};
 use quick_xml::events::Event;
