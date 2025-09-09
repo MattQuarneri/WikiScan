@@ -57,5 +57,7 @@ ncat -lk 9000 -e ./wikiscan
 - See `notes.md` for advanced usage, operational tips, and integration ideas (WebSocket, systemd, etc).
 
 ## License
-Developed by Matthew Quarneri with assitance from a windsurfing ChadG
 MIT
+
+Developed by Matthew Quarneri with assitance from a windsurfing ChadG
+
