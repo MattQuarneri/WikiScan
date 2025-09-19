@@ -48,6 +48,89 @@ socat TCP-LISTEN:9000,reuseaddr,fork EXEC:./wikiscan
 ncat -lk 9000 -e ./wikiscan
 ```
 
+### Websocket REPL Encapsulation:
+Recommended architecture
+
+* Bun as the WebSocket gateway
+    * Authenticates the client (JWT/cookies/session).
+    * On WS connect, opens a TCP connection to your Rust REPL server (wikiscan --tcp:9000).
+    * Bi-directionally relays data between WS and TCP (one WS = one REPL session).
+    * Terminates TLS or sits behind a reverse proxy that does.
+
+* Rust process
+    * Run your binary in TCP mode: wikiscan --tcp:9000
+    * Each TCP connection = an independent REPL session.
+    * Colors disabled in network mode (already implemented).
+    * “Q” still cancels long-running jobs (you just send Q\n from the WS client).
+
+* Reverse proxy (optional but recommended)
+    * Caddy/Nginx/Traefik for TLS, rate-limit, logging, request size limits.
+    * Can also terminate TLS and then forward to Bun (WS) and to Rust (TCP if you want to split networks).
+
+## Bun WebSocket bridge (example)
+
+* BunServe.ts is a compact Bun app that:
+    * Auth checks a header (replace with your auth).
+    * Opens a TCP connection to 127.0.0.1:9000.
+    * Pipes WS -> TCP and TCP -> WS with basic backpressure handling, heartbeats, and cleanup.
+
+### How To Run everything
+
+* Start Rust REPL server:
+```sh
+wikiscan --tcp:9000
+```
+* Start Bun gateway:
+```sh
+bun run server.ts
+```
+* Client connects to WS:
+```sh
+wss://your-host/ws
+```
+Send text lines like W=/path/to/enwiki… followed by newline.
+“Q” and Enter cancels long-running ops.
+
+### Containerization (quick plan)
+
+Multi-stage Dockerfile for Rust:
+```Dockerfile
+# Stage 1: build with cargo build --release
+# Stage 2: distroless or debian-slim, copy the binary only
+# Expose 9000/tcp
+```
+Bun Dockerfile:
+```Dockerfile
+FROM oven/bun
+COPY server.ts package.json bun.lockb
+RUN bun install
+EXPOSE 8080
+```
+docker-compose.yml:
+```yaml
+service “wikiscan”: runs wikiscan --tcp:9000, mounts the dump path (or uses local SSD).
+service “gateway”: runs Bun, depends_on wikiscan, exposes port 8080.
+Put Caddy/Traefik in front for TLS and to expose only 443/80.
+```
+
+### Operational tips
+
+Authentication
+* Keep the TCP REPL bound to localhost or a private interface.
+* Bun authenticates and is the only thing talking to the TCP port.
+Backpressure and framing
+* The REPL is line-based. Ensure clients send newline-delimited commands.
+* Your current loop trims input and prints output promptly; we added flushes in the refactor.
+Heartbeats and idle timeouts
+* Use ws.ping() every 30s and close idle sessions if needed.
+Cancellation
+* “Q” + Enter is still the canonical cancel; WS clients send “Q\n”.
+S3 data
+* For large scans, copying the dump to a local ephemeral volume before starting is typically faster and more predictable than streaming directly over S3. If you need remote access, consider a pre-warmed EC2 instance with local NVMe.
+Alternative: Native Rust WebSocket
+
+If you prefer a single binary: axum + tokio-tungstenite can serve /ws, authenticate via headers/cookies, and call run_repl over a stream wrapper. It’s fast and removes the Bun dependency, but you then own auth middleware in Rust. Your current TCP + Bun split keeps concerns nicely separated.
+
 ## Notes
 
 - Scanning large dumps is CPU/IO intensive; use release mode for best performance.
