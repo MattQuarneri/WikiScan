@@ -11,11 +11,28 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::env;
 use std::fs::OpenOptions;
-use std::net::TcpListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// Reusable container for Terminal/TCP REPL modes
+mod appserv;
+use crate::appserv::{start_tcp_server as start_tcp_server_generic, start_terminal, ReplService};
+
+#[derive(Clone)]
+struct WikiScanService;
+
+impl ReplService for WikiScanService {
+    fn run_session<R, W>(&self, stdin: R, out: W, enable_colors: bool) -> anyhow::Result<()>
+    where
+        R: BufRead + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        // Delegate to existing REPL implementation
+        run_repl(stdin, out, enable_colors)
+    }
+}
 
 const SETTINGS_FILE: &str = "settings.ini";
 
@@ -436,11 +453,9 @@ fn infer_multistream_index_path(dump_path: &str) -> Option<String> {
 }
 
 fn start_interactive() -> Result<()> {
-    // Auto-detect color for stdio
-    let enable_colors = std::env::var("NO_COLOR").ok().is_none();
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    run_repl(io::BufReader::new(stdin), stdout, enable_colors)
+    // Use the generic terminal runner with our service
+    let svc = WikiScanService;
+    start_terminal(&svc)
 }
 
 fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool) -> Result<()> {
@@ -848,7 +863,7 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
             continue;
         }
 
-        println!("unknown command. Examples:\n  W=/path/to/enwiki-*-multistream.xml.bz2\n  I=keyword\n  S=keyword\n  search=keyword2\n  filter=substring\n  Page=Title\n  PageText=Title\n  PageJSON=Title");
+        println!("unknown command. Examples:\n  W=/path/to/enwiki-*-multistream.xml.bz2\n  I=keyword\n  S=keyword\n  search=pages have this word\n  filter=next index has this word\n show=show 100 page titles\n back=go back to prior index\n  Page=Title\n  PageText=Title\n  PageJSON=Title\n quit=exit the program\n");
     }
 
     Ok(())
@@ -1393,16 +1408,7 @@ fn main() -> Result<()> {
 // accepted socket to the child's stdin/stdout (inetd-style). This allows us
 // to reuse the existing interactive REPL without refactoring its I/O now.
 fn start_tcp_server(addr: &str) -> Result<()> {
-    println!("listening for REPL connections on {}...", addr);
-    let listener = TcpListener::bind(addr)
-        .with_context(|| format!("binding tcp listener at {}", addr))?;
-    loop {
-        let (stream, peer) = listener.accept()?;
-        println!("connection from {}", peer);
-        let mut writer = stream.try_clone()?;
-        let reader = io::BufReader::new(stream);
-        std::thread::spawn(move || {
-            let _ = run_repl(reader, &mut writer, /*enable_colors=*/ false);
-        });
-    }
+    // Delegate to generic TCP server with our service
+    let svc = WikiScanService;
+    start_tcp_server_generic(svc, addr)
 }
