@@ -19,3 +19,41 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Node / Bun
+node_modules/
+.bun/
+
+# Package manager caches
+.npm/
+.pnpm-store/
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+.yarn-cache/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+bun-debug.log*
+
+# Tool caches
+.cache/
+.parcel-cache/
+.turbo/
+.eslintcache
+
+# Build outputs
+dist/
+build/
+out/
+coverage/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/

@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WikiScan UI</title>
+    <style>
+      :root {
+        --bg: #0f1116;
+        --panel: #151823;
+        --text: #e6e6e6;
+        --muted: #9aa4b2;
+        --accent: #5aa7ff;
+        --border: #273043;
+        --ok: #2ecc71;
+        --warn: #f1c40f;
+        --err: #e74c3c;
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+      .wrap { display: grid; grid-template-columns: 360px 1fr; grid-template-rows: auto 1fr; gap: 12px; padding: 14px; height: 100%; box-sizing: border-box; }
+      header { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; }
+      h1 { font-size: 18px; margin: 0; letter-spacing: 0.2px; }
+      .status { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+      .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+      .controls { display: flex; flex-direction: column; gap: 10px; }
+      .row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; }
+      .row label { font-size: 12px; color: var(--muted); }
+      input[type="text"] { width: 100%; background: #0d1018; color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-family: var(--mono); font-size: 13px; outline: none; }
+      input[type="text"]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(90,167,255,0.15); }
+      button { background: var(--accent); color: #081018; border: none; border-radius: 8px; padding: 8px 10px; font-weight: 600; cursor: pointer; font-size: 13px; }
+      button.secondary { background: #212a3b; color: var(--text); }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+      .pane { display: grid; grid-template-rows: 1fr auto; gap: 12px; }
+      .section-title { font-size: 12px; color: var(--muted); margin: 0 0 8px 0; letter-spacing: 0.3px; text-transform: uppercase; }
+      pre, .log, .page { background: #0b0e15; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-family: var(--mono); font-size: 13px; line-height: 1.45; overflow: auto; white-space: pre-wrap; }
+      .log { min-height: 180px; }
+      .page { height: calc(100vh - 190px); }
+      ol { margin: 6px 0 0; padding-left: 20px; }
+      li a { color: var(--accent); text-decoration: none; cursor: pointer; }
+      li a:hover { text-decoration: underline; }
+      .busy { display: none; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+      .spinner { width: 14px; height: 14px; border: 2px solid rgba(90,167,255,0.25); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>WikiScan</h1>
+        <div class="status" id="connStatus">Disconnected</div>
+      </header>
+
+      <section class="card controls">
+        <div class="row">
+          <label for="wPath">W=</label>
+          <input id="wPath" type="text" placeholder="/path/to/enwiki-*-multistream.xml.bz2" />
+          <button id="wSetBtn" class="secondary">Set</button>
+        </div>
+        <div class="row">
+          <label for="idxName">I=</label>
+          <input id="idxName" type="text" placeholder="keyword for index" />
+          <button id="idxBtn">Index</button>
+        </div>
+        <div class="row">
+          <label for="filterText">Filter:</label>
+          <input id="filterText" type="text" placeholder="substring for title-only filter" />
+          <button id="filterBtn" class="secondary">Filter</button>
+        </div>
+        <div class="row" style="grid-template-columns: 1fr 1fr 1fr;">
+          <button id="showBtn" class="secondary">show</button>
+          <button id="backBtn" class="secondary">back</button>
+          <button id="stopBtn" class="secondary" title="Send Q to stop long-running tasks">Stop (Q)</button>
+        </div>
+        <div class="busy" id="busyBar"><span class="spinner"></span><span id="busyMsg">Working…</span></div>
+        <div>
+          <p class="section-title">Index State</p>
+          <div id="IndexState" class="log"></div>
+          <p class="section-title" style="margin-top:10px;">Titles</p>
+          <div id="showList" class="log" style="min-height: 120px;"></div>
+        </div>
+      </section>
+
+      <section class="pane">
+        <div>
+          <p class="section-title">Wiki Page</p>
+          <div id="wikipage" class="page"></div>
+        </div>
+        <div class="card">
+          <p class="section-title">Raw Console</p>
+          <div id="console" class="log"></div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById('connStatus');
+      const consoleEl = document.getElementById('console');
+      const indexEl = document.getElementById('IndexState');
+      const showListEl = document.getElementById('showList');
+      const pageEl = document.getElementById('wikipage');
+
+      const wPath = document.getElementById('wPath');
+      const wSetBtn = document.getElementById('wSetBtn');
+      const idxName = document.getElementById('idxName');
+      const idxBtn = document.getElementById('idxBtn');
+      const filterText = document.getElementById('filterText');
+      const filterBtn = document.getElementById('filterBtn');
+      const showBtn = document.getElementById('showBtn');
+      const backBtn = document.getElementById('backBtn');
+
+      const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+      const wsUrl = `${proto}://${location.host}/ws`;
+      let lastRoute = null; // 'index' | 'show' | 'page' | null
+      let accBuf = '';
+      let flushTimer = null;
+      let busy = false;
+      const busyBar = document.getElementById('busyBar');
+      const busyMsg = document.getElementById('busyMsg');
+
+      function append(el, text) {
+        el.textContent += text;
+        el.scrollTop = el.scrollHeight;
+      }
+
+      function set(el, html) {
+        el.innerHTML = html;
+      }
+
+      function sanitize(s) {
+        const div = document.createElement('div');
+        div.textContent = s;
+        return div.innerHTML;
+      }
+
+
+      let ws;
+      let reconnectAttempts = 0;
+
+      function connect() {
+        const token = localStorage.getItem('ws_token') || new URLSearchParams(window.location.search).get('token');
+        const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+        const wsUrl = `${proto}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+
+        statusEl.textContent = 'Connecting...';
+        ws = new WebSocket(wsUrl);
+        // Prefer getting binary frames as ArrayBuffer instead of Blob
+        try { ws.binaryType = 'arraybuffer'; } catch {}
+
+        ws.onopen = () => { reconnectAttempts = 0; statusEl.textContent = 'Connected'; };
+        ws.onclose = () => { 
+            statusEl.textContent = 'Disconnected';
+            stopBusy(); // ensure spinners stop
+            // Backoff: 0.5s, 1s, 2s, 4s, capped
+            const delay = Math.min(4000, 500 * Math.pow(2, reconnectAttempts++));
+            setTimeout(connect, delay);
+         };
+        ws.onerror = () => { statusEl.textContent = 'WebSocket Error'; };
+        ws.onmessage = (ev) => {
+          const val = ev.data;
+          if (typeof val === 'string') {
+            accBuf += val;
+            scheduleFlush();
+            return;
+          }
+          if (val instanceof ArrayBuffer) {
+            accBuf += new TextDecoder().decode(val);
+            scheduleFlush();
+            return;
+          }
+          if (val instanceof Blob) {
+            // In case binaryType couldn't be set; convert Blob -> ArrayBuffer asynchronously
+            val.arrayBuffer().then((buf) => {
+              accBuf += new TextDecoder().decode(buf);
+              scheduleFlush();
+            }).catch(() => {});
+            return;
+          }
+          // Fallback: stringify
+          accBuf += String(val);
+          scheduleFlush();
+        };
+      }
+
+      function scheduleFlush() {
+        if (flushTimer) clearTimeout(flushTimer);
+        // Debounce flush to aggregate chunked frames
+        flushTimer = setTimeout(() => flushBuffer(), 150);
+      }
+
+      function flushBuffer() {
+        flushTimer = null;
+        const text = accBuf;
+        accBuf = '';
+        if (!text) return;
+
+        // Always mirror raw console
+        append(consoleEl, text);
+
+        if (lastRoute === 'show') {
+          renderShowList(text);
+        } else if (lastRoute === 'index') {
+          append(indexEl, text);
+          // Heuristics to stop busy state
+          if (/\b(Done\.|Stopped\.|Index updated:|New index size:|Title-filter applied\.)/.test(text)) {
+            stopBusy();
+          }
+        } else if (lastRoute === 'page') {
+          // Expect JSON; try to parse and render structured. Fallback to pre.
+          try {
+            const obj = JSON.parse(text);
+            renderPageJSON(obj);
+          } catch {
+            pageEl.innerHTML = `<pre>${sanitize(text)}</pre>`;
+          }
+        }
+      }
+
+      function renderShowList(text) {
+        // Parse lines like: "  1. Title"
+        const lines = text.split(/\r?\n/);
+        const items = [];
+        const rx = /^\s*\d+\.\s+(.*)$/;
+        for (const ln of lines) {
+          const m = rx.exec(ln);
+          if (m && m[1]) items.push(m[1]);
+        }
+        if (items.length === 0) {
+          // Fallback: show raw
+          showListEl.innerHTML = `<pre>${sanitize(text)}</pre>`;
+          return;
+        }
+        const ol = document.createElement('ol');
+        for (const title of items) {
+          const li = document.createElement('li');
+          const a = document.createElement('a');
+          a.textContent = title;
+          a.href = '#';
+          a.onclick = (e) => { e.preventDefault(); sendCommand(`PageJSON=${title}`, 'page'); };
+          li.appendChild(a);
+          ol.appendChild(li);
+        }
+        showListEl.innerHTML = '';
+        showListEl.appendChild(ol);
+      }
+
+      function renderPageJSON(obj) {
+        // obj = { title, page_id, wikitext, headings: [{level,text,...}] }
+        const wrap = document.createElement('div');
+        wrap.className = 'pagewrap';
+
+        const h2 = document.createElement('h2');
+        h2.textContent = obj.title || '(untitled)';
+        h2.style.marginTop = '0';
+        wrap.appendChild(h2);
+
+        const meta = document.createElement('div');
+        meta.style.color = 'var(--muted)';
+        meta.style.fontFamily = 'var(--mono)';
+        meta.style.fontSize = '12px';
+        meta.textContent = `page_id: ${obj.page_id ?? 'n/a'}  |  bytes: ${obj.wikitext ? obj.wikitext.length : 0}`;
+        wrap.appendChild(meta);
+
+        if (Array.isArray(obj.headings) && obj.headings.length) {
+          const h3 = document.createElement('p');
+          h3.className = 'section-title';
+          h3.textContent = 'Headings';
+          wrap.appendChild(h3);
+          const ul = document.createElement('ul');
+          for (const h of obj.headings) {
+            const li = document.createElement('li');
+            li.textContent = `${'#'.repeat(Math.max(1, Math.min(6, h.level || 1)))} ${h.text || ''}`;
+            ul.appendChild(li);
+          }
+          wrap.appendChild(ul);
+        }
+
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = 'Show raw wikitext';
+        details.appendChild(summary);
+        const pre = document.createElement('pre');
+        pre.textContent = obj.wikitext || '';
+        details.appendChild(pre);
+        wrap.appendChild(details);
+
+        pageEl.innerHTML = '';
+        pageEl.appendChild(wrap);
+      }
+
+      function sendCommand(cmd, route) {
+        lastRoute = route || null;
+        indexEl && (route === 'index') && (indexEl.textContent = '');
+        if (route === 'show') showListEl.innerHTML = '';
+        if (route === 'page') pageEl.innerHTML = '';
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(cmd + '\n');
+        } else {
+          append(consoleEl, `\n[ws] not connected; cannot send: ${cmd}\n`);
+        }
+      }
+
+      function startBusy(msg) {
+        busy = true;
+        busyMsg.textContent = msg || 'Working…';
+        busyBar.style.display = 'flex';
+      }
+      function stopBusy() {
+        busy = false;
+        busyBar.style.display = 'none';
+      }
+
+      // Wire up controls
+      wSetBtn.addEventListener('click', () => {
+        const p = wPath.value.trim();
+        if (p) sendCommand(`W=${p}`, 'index');
+      });
+      idxBtn.addEventListener('click', () => {
+        const k = idxName.value.trim();
+        if (k) { startBusy('Indexing… (you can press Stop to send Q)'); sendCommand(`I=${k}`, 'index'); }
+      });
+      filterBtn.addEventListener('click', () => {
+        const f = filterText.value.trim();
+        if (f) { startBusy('Filtering…'); sendCommand(`filter=${f}`, 'index'); }
+      });
+      showBtn.addEventListener('click', () => sendCommand('show', 'show'));
+      backBtn.addEventListener('click', () => sendCommand('back', 'index'));
+      document.getElementById('stopBtn').addEventListener('click', () => {
+        sendCommand('Q', 'index');
+      });
+
+      // Enter key convenience
+      wPath.addEventListener('keydown', (e) => { if (e.key === 'Enter') wSetBtn.click(); });
+      idxName.addEventListener('keydown', (e) => { if (e.key === 'Enter') idxBtn.click(); });
+      filterText.addEventListener('keydown', (e) => { if (e.key === 'Enter') filterBtn.click(); });
+
+      connect();
+    </script>
+  </body>
+</html>
