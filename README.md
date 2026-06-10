@@ -20,6 +20,23 @@ The app's CLI can be used accessed locally via a local or network (websocket) te
 cargo run --release -- "/path/to/enwiki-YYYYMMDD-pages-articles-multistream.xml.bz2" "Keyword"
 ```
 
+### Scanning Details
+When you run `I=Keyword Index`, WikiScan will read through the specified Wikipedia dump file and create an index of article titles that contain the keyword "Keyword". This index will store the article titles along with their byte offsets in the compressed dump file, allowing for fast access later. The first time you build this index, it may take some time as it needs to scan through the entire dump. However, once built, you can save it to disk for much faster loading in future sessions.
+
+The "header-scan" first step reads through the compressed BZh dump file and identifies the byte offsets of article titles that match the specified keyword. The second "validating headers" step confirms each candidate is a real bzip2 member start by trying a tiny decompression read from that offset. Candidates that produce at least 1 byte are kept; errors or zero-byte reads are discarded. This removes false positives from random BZh-like bytes in compressed data.
+
+Where it happens:
+Candidate scan and validation loop: wikiscan.rs:246 and progress line at wikiscan.rs:336
+Called as fallback while building indexes: wikiscan.rs:1199
+Also used in in-memory/fallback search flows: wikiscan.rs:372 and wikiscan.rs:813
+
+Why it exists:
+Accuracy: avoids treating bad offsets as block starts.
+Stability: downstream page extraction/indexing only gets valid member offsets.
+Cost control: validation read is capped to a small chunk, so it is faster than full decompression per candidate
+
+This allows WikiScan to quickly jump to relevant articles without having to decompress the entire file. The resulting index is stored in memory and can be saved to disk for future use, significantly improving performance for subsequent searches.
+
 ### Start interactive REPL:
 ```sh
 cargo run --release

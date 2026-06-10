@@ -280,7 +280,7 @@ fn find_bzip2_member_offsets(dump_bz2_path: &str, cancel: Option<&Arc<AtomicBool
                 let s = spinner[spin_i % spinner.len()];
                 spin_i = spin_i.wrapping_add(1);
                 let pct = if total_bytes > 0 { (file_pos as f64) * 100.0 / (total_bytes as f64) } else { 0.0 };
-                eprint!("{} header-scan: {:.2}% of file (found {} members)\r", s, pct, offsets.len());
+                eprint!("{} header-scan: {:.2}% of file (scannned {} blocks)\r", s, pct, offsets.len());
                 let _ = std::io::Write::flush(&mut std::io::stderr());
                 last_tick = Instant::now();
             }
@@ -300,11 +300,12 @@ fn find_bzip2_member_offsets(dump_bz2_path: &str, cancel: Option<&Arc<AtomicBool
             let s = spinner[spin_i % spinner.len()];
             spin_i = spin_i.wrapping_add(1);
             let pct = if total_bytes > 0 { (file_pos as f64) * 100.0 / (total_bytes as f64) } else { 0.0 };
-            eprint!("{} header-scan: {:.2}% of file (found {} members)\r", s, pct, offsets.len());
+            eprint!("{} header-scan: {:.2}% of file (scanned {} blocks)\r", s, pct, offsets.len());
             let _ = std::io::Write::flush(&mut std::io::stderr());
             last_tick = Instant::now();
         }
     }
+    eprintln!(); // Move to new line to prevent overwriting scan stats with validation stats
     offsets.sort_unstable();
     offsets.dedup();
     // Validate candidates by attempting a tiny decompression at each offset.
@@ -347,35 +348,31 @@ fn build_keyword_index_mem(
     multistream_index_bz2: &str,
     keyword: &str,
 ) -> Result<(HashMap<String, u64>, u64, u64)> {
-    // Prefer the multistream index; if missing, fall back to an existing {keyword}.idx in the dump directory
-    let index: HashMap<String, IndexEntry> = if Path::new(multistream_index_bz2).exists() {
-        load_index(multistream_index_bz2).context("loading multistream index")?
-    } else {
-        let dump_dir = Path::new(dump_bz2_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| Path::new(".").to_path_buf());
-        let fallback_idx = dump_dir.join(format!("{}.idx", keyword));
-        if fallback_idx.exists() {
-            // Load keyword idx and synthesize IndexEntry values (page_id unknown -> 0)
-            let km = load_keyword_idx(fallback_idx.to_string_lossy().as_ref())
-                .with_context(|| format!("loading fallback keyword idx: {}", fallback_idx.display()))?;
-            let mut out = HashMap::new();
-            for (title, off) in km {
-                out.entry(title.clone()).or_insert(IndexEntry { offset: off, page_id: 0, title });
-            }
-            out
-        } else {
-            bail!(
-                "neither multistream index '{}' nor fallback '{}' found",
-                multistream_index_bz2,
-                fallback_idx.display()
-            );
-        }
-    };
-    let mut offsets: Vec<u64> = {
+    // Prefer the multistream index; if missing, fall back to an existing {keyword}.idx in the dump directory, or scan headers.
+    let mut offsets: Vec<u64> = if Path::new(multistream_index_bz2).exists() {
+        let index = load_index(multistream_index_bz2).context("loading multistream index")?;
         let mut s: HashSet<u64> = HashSet::new();
         for v in index.values() { s.insert(v.offset); }
         let mut v: Vec<u64> = s.into_iter().collect();
         v.sort_unstable();
         v
+    } else {
+        let dump_dir = Path::new(dump_bz2_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| Path::new(".").to_path_buf());
+        let fallback_idx = dump_dir.join(format!("{}.idx", keyword));
+        if fallback_idx.exists() {
+            let km = load_keyword_idx(fallback_idx.to_string_lossy().as_ref())
+                .with_context(|| format!("loading fallback keyword idx: {}", fallback_idx.display()))?;
+            let mut s: HashSet<u64> = HashSet::new();
+            for off in km.values() { s.insert(*off); }
+            let mut v: Vec<u64> = s.into_iter().collect();
+            v.sort_unstable();
+            v
+        } else {
+            println!("note: multistream index not found; scanning dump for bzip2 member headers to begin indexing...");
+            let v = find_bzip2_member_offsets(dump_bz2_path, None)?;
+            if v.is_empty() { bail!("no bzip2 members detected in dump: {}", dump_bz2_path); }
+            v
+        }
     };
     let kw_lower = keyword.to_lowercase();
 
@@ -496,6 +493,11 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
     writeln!(
         out,
         "{gray}{blue}Page={reset}{white}{{<Page Title>}}{reset}{gray}: show the raw wikitext of the named page from the current index{reset}",
+        gray=gray, blue=blue, reset=reset, white=white
+    )?;
+    writeln!(
+        out,
+        "{gray}{blue}P={reset}{white}{{<Page Title>}}{reset}{gray}: shorthand for Page= to quickly show page wikitext{reset}",
         gray=gray, blue=blue, reset=reset, white=white
     )?;
     writeln!(
@@ -713,18 +715,236 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
                 println!("set dump path first: W={{path}}");
                 continue;
             };
-            let keyword = rest.trim();
-            if keyword.is_empty() { println!("provide a keyword: i={keyword}"); continue; }
+            
+            // Parse for optional "+N" limit suffix
+            let mut keyword = rest.trim().to_string();
+            let mut limit_prefix = false;
+            let mut target_match_idx = 1; // 1-based index of the match we want to return
+            
+            if let Some(plus_idx) = keyword.rfind('+') {
+                if let Ok(n) = keyword[plus_idx+1..].trim().parse::<usize>() {
+                    limit_prefix = true;
+                    target_match_idx = n;
+                    keyword = keyword[..plus_idx].trim().to_string();
+                }
+            }
+            if keyword.is_empty() { println!("provide a keyword: S=Keyword (+N)"); continue; }
+            if target_match_idx == 0 { target_match_idx = 1; }
+
+            // .pi file logic (Partial Index, just lines of Title\tOffset)
+            let dump_dir = Path::new(dump).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| Path::new(".").to_path_buf());
+            let pi_filename = format!("{}.pi", keyword);
+            let pi_path = dump_dir.join(&pi_filename);
+
+            // 1. Load existing matches from .pi file
+            let mut existing_map: HashMap<String, u64> = HashMap::new();
+            if pi_path.exists() {
+                if let Ok(m) = load_keyword_idx(pi_path.to_string_lossy().as_ref()) {
+                    existing_map = m;
+                }
+            }
+            // Sort matches by title or offset? Actually "nth result" usually implies scan order.
+            // But Map is unordered. Let's reconstruct order by offsets? No, we don't have order in map.
+            // But we can just count matches in map.
+            // Wait, if user wants "+9", they want the 9th result *found*? Or 9th alphabetically?
+            // "scan will save the 9 offsets... and return the 9th". Typically scan order.
+            // Since invalidating the map throws away order, let's just rely on map size.
+            // Wait, to "return the 9th", we need to know WHICH one is the 9th.
+            // Let's reload the file strictly as a list to find the Nth.
+            let mut existing_list: Vec<(String, u64)> = Vec::new();
+            if pi_path.exists() {
+               if let Ok(f) = File::open(&pi_path) {
+                    for line in BufReader::new(f).lines() {
+                        if let Ok(l) = line {
+                            if let Some((t, o)) = l.split_once('\t') {
+                                if let Ok(off) = o.parse::<u64>() {
+                                    existing_list.push((t.to_string(), off));
+                                }
+                            }
+                        }
+                    }
+               }
+            }
+            
+            // Fast path: if we already have >= N matches
+            if existing_list.len() >= target_match_idx {
+                let (title, off) = &existing_list[target_match_idx - 1]; // 0-based
+                println!("Fast-loading match #{} from {}: {}", target_match_idx, pi_filename, title);
+                // Load page content
+                match extract_article(dump, *off, title, 0) {
+                    Ok(article) => {
+                        let plain = render_plaintext(&article.wikitext);
+                        println!("===== {} (page_id: {}) =====", article.title, article.page_id);
+                        println!("{}", plain);
+                        println!("===== END {} =====", article.title);
+                    }
+                    Err(e) => println!("error extracting page '{}': {}", title, e),
+                }
+                // Also update session index so subsequent commands work
+                // But S= usually Replaces the index.
+                // Let's update session with what we have.
+                let mut map = HashMap::new();
+                for (t, o) in &existing_list { map.insert(t.clone(), *o); }
+                session.indexes.clear();
+                session.indexes.push(NamedIndex { name: keyword.clone(), map });
+                continue;
+            }
+
+            // Slow path: Need to scan for more matches
+            println!("Scanning for match #{} (have {})...", target_match_idx, existing_list.len());
+            
             let Some(ms_index) = infer_multistream_index_path(dump) else {
                 println!("could not infer multistream index path from dump: {}", dump);
-                println!("expected file alongside dump ending with '-multistream-index.txt.bz2'");
                 continue;
             };
-            println!("Building in-memory index for '{}'...", keyword);
-            let (map, pages, matches) = build_keyword_index_mem(dump, &ms_index, keyword)?;
-            session.indexes.clear();
-            session.indexes.push(NamedIndex { name: keyword.to_string(), map });
-            println!("Scanned pages: {}\nMatches: {}\nIndexed titles: {}", pages, matches, session.current_index_len());
+
+            // Get member offsets (header scan or index load)
+            // Reuse logic from 'build_keyword_index_mem' but adapted for streaming stop
+             // Prefer the multistream index; if missing, fall back to an existing {keyword}.idx in the dump directory
+            // Note: we can't use the FULL build because we want to stop early.
+            // Let's just gather offsets first.
+            let mut member_offsets: Vec<u64> = if Path::new(&ms_index).exists() {
+                if let Ok(idx) = load_index(&ms_index) {
+                     let mut s = HashSet::new(); for v in idx.values() { s.insert(v.offset); }
+                     let mut v: Vec<u64> = s.into_iter().collect(); v.sort_unstable(); v
+                } else { Vec::new() }
+            } else {
+                 println!("note: multistream index not found; scanning dump for bzip2 headers...");
+                 find_bzip2_member_offsets(dump, None).unwrap_or_default()
+            };
+            if member_offsets.is_empty() { println!("no members found."); continue; }
+            
+            // Skip members already fully covered?
+            // "growing index... opened in read-only".
+            // We just need to resume scanning from where we left off.
+            // What was the max offset in the current .pi file?
+            let max_seen_offset = existing_list.iter().map(|(_, o)| *o).max().unwrap_or(0);
+            
+            // We should start scanning members >= max_seen_offset.
+            // Actually, a member can contain multiple matches. If we scanned it before, we found them.
+            // So we can strictly skip members <= max_seen_offset IF we assume we finished that member.
+            // To be safe, let's skip members strictly *less* than max_seen_offset, and re-scan the one equal to it just in case partial write?
+            // Or just skip all <=. Let's skip <=.
+            // Wait, if the .pi file has matches from offset X, we don't want to duplicate them in the .pi file.
+            // We'll filter duplicates in memory before appending.
+            
+            let start_index = member_offsets.partition_point(|&x| x <= max_seen_offset);
+            // Actually, if we found a match at offset X, we might have quit immediately after.
+            // So we might have MISSED other matches in offset X?
+            // If "first result... saves... dumps... stops", then yes, we abort mid-member?
+            // `visit_pages_in_member` visits all pages in that member. We can't stop mid-member comfortably with current API.
+            // But `visit_pages_in_member` runs quickly (100 pages). Let's assume we finish the member.
+            // So we can safely skip <= max_seen_offset.
+            
+            // But wait: if we *just* wrote to .pi from offset X, then stopped.
+            // Next time we load .pi, max offset is X.
+            // If we skip <= X, we skip X. We won't re-scan X. That's good.
+            
+            // But what if the previous run crashed mid-member? We'd lose tail matches in that member.
+            // Acceptable risk for "lazy partial index".
+            
+            let scan_queue = &member_offsets[start_index..];
+            
+            let kw_lower = keyword.to_lowercase();
+            let mut matches_found_session = 0;
+            let mut matches_total = existing_list.len();
+            
+            // We need to append to .pi file
+            let mut pi_file = OpenOptions::new().create(true).append(true).open(&pi_path)
+                .with_context(|| format!("opening .pi file: {}", pi_path.display()));
+            
+            if let Err(e) = pi_file { println!("error opening .pi file: {}", e); continue; }
+            let mut pi_file = pi_file.unwrap();
+            
+            let mut found_target = false;
+            let mut target_article: Option<Article> = None;
+            
+            let mut existing_set: HashSet<String> = existing_list.iter().map(|(t,_)| t.clone()).collect();
+
+            println!("Resuming scan from member #{} ({} members left)...", start_index, scan_queue.len());
+
+            for &off in scan_queue {
+                 // Visit member
+                // cancellation support?
+                // Minimal support: check our own Abort flag? Nah, let's just loop.
+                // We'll just break if we hit target.
+                
+                let mut member_matches = Vec::new();
+                let res = visit_pages_in_member(dump, off, |title, text, _pid| {
+                    if !kw_lower.is_empty() && text.to_lowercase().contains(&kw_lower) {
+                         if !existing_set.contains(title) {
+                             member_matches.push((title.to_string(), off));
+                             // If this is the one we want, Capture it!
+                             // "return the 9th"
+                             // matches_total is count BEFORE this member.
+                             // current count = matches_total + member_matches.len()
+                             let current_idx = matches_total + member_matches.len();
+                             if current_idx == target_match_idx {
+                                 // Bingo. Extract article.
+                                 // We have text right here! But `visit_pages_in_member` gives us &str.
+                                 // We can just clone it.
+                                 // Construct article.
+                                 let headings = extract_headings(text);
+                                 target_article = Some(Article { 
+                                     title: title.to_string(), 
+                                     page_id: _pid, 
+                                     wikitext: text.to_string(), 
+                                     headings 
+                                 });
+                             }
+                         }
+                    }
+                }, None);
+                
+                if let Err(e) = res {
+                    eprintln!("error scanning member {}: {}", off, e);
+                    continue;
+                }
+                
+                if !member_matches.is_empty() {
+                    // Append to file and flush
+                    for (t, o) in &member_matches {
+                        if let Err(e) = writeln!(pi_file, "{}\t{}", t, o) {
+                             eprintln!("error writing to .pi: {}", e);
+                        }
+                        // update local state
+                        existing_list.push((t.clone(), *o));
+                        existing_set.insert(t.clone());
+                    }
+                    let _ = pi_file.flush();
+                    
+                    matches_total += member_matches.len();
+                    println!("Found {} new matches (total {})...", member_matches.len(), matches_total);
+                    
+                    if target_article.is_some() {
+                        found_target = true;
+                        break; // Stop scanning!
+                    }
+                    
+                    // If we passed the target (e.g. we wanted #5, but this member brought us to #10 and we somehow missed capturing #5?)
+                    // The capture logic is inside the closure, so it should have caught it.
+                    if matches_total >= target_match_idx {
+                        // If target_match_idx was inside this batch, we captured it.
+                        // If target_match_idx < matches_total (because we started with existing > target?), we handled that in Fast Path.
+                        break;
+                    }
+                }
+            }
+            
+            if let Some(art) = target_article {
+                let plain = render_plaintext(&art.wikitext);
+                println!("===== {} (page_id: {}) =====", art.title, art.page_id);
+                println!("{}", plain);
+                println!("===== END {} =====", art.title);
+            } else if matches_total < target_match_idx {
+                 println!("Finished scan. Found {} total matches. Requested #{}.", matches_total, target_match_idx);
+            }
+            
+            // Update session with what we have
+             let mut map = HashMap::new();
+             for (t, o) in &existing_list { map.insert(t.clone(), *o); }
+             session.indexes.push(NamedIndex { name: keyword.to_string(), map });
+            
             continue;
         }
 
@@ -768,7 +988,12 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
         }
 
         // New: show page wikitext using the current index's member offset
-        if let Some(title_in) = line.strip_prefix("Page=").or_else(|| line.strip_prefix("page=")) {
+        if let Some(title_in) = line
+            .strip_prefix("Page=")
+            .or_else(|| line.strip_prefix("page="))
+            .or_else(|| line.strip_prefix("P="))
+            .or_else(|| line.strip_prefix("p="))
+        {
             let want_title = title_in.trim();
             if want_title.is_empty() {
                 println!("provide a page title: Page=<Title>");
@@ -863,7 +1088,7 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
             continue;
         }
 
-        println!("unknown command. Examples:\n  W=/path/to/enwiki-*-multistream.xml.bz2\n  I=keyword\n  S=keyword\n  search=pages have this word\n  filter=next index has this word\n show=show 100 page titles\n back=go back to prior index\n  Page=Title\n  PageText=Title\n  PageJSON=Title\n quit=exit the program\n");
+        println!("unknown command. Examples:\n  W=/path/to/enwiki-*-multistream.xml.bz2\n  I=your text = indexes 'your text' to an index file.\n  S=your text = indexes your text to an in-memory index.\n  search=your text = searches pages in the index that have your text\n  filter=your text = filters indexed page names that have your text\n show=show 100 page titles\n back=go back to prior index\n  Page=Title\n  P=Title\n  PageText=Title\n  PageJSON=Title\n quit=exit the program\n");
     }
 
     Ok(())
