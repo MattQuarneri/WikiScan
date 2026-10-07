@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use bzip2::read::{BzDecoder, MultiBzDecoder};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -1119,7 +1120,7 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
 fn visit_pages_in_member<F>(
     dump_bz2_path: &str,
     offset: u64,
-    mut handler: F,
+    handler: F,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<()>
 where
@@ -1127,7 +1128,24 @@ where
 {
     let mut file = File::open(dump_bz2_path)?;
     file.seek(SeekFrom::Start(offset))?;
-    let dec = BzDecoder::new(BufReader::new(file));
+    visit_pages_in_member_reader(BufReader::new(file), offset, handler, cancel)
+}
+
+/// Same as `visit_pages_in_member`, but reads the compressed member from an
+/// already-positioned byte stream instead of opening + seeking the dump file.
+/// Used by the parallel scan (OPT-03), which hands each worker a slice of a
+/// single memory-mapped dump.
+fn visit_pages_in_member_reader<F, R>(
+    reader_in: R,
+    offset: u64,
+    mut handler: F,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()>
+where
+    F: FnMut(&str, &str, u64),
+    R: Read,
+{
+    let dec = BzDecoder::new(BufReader::new(reader_in));
     let mut reader = Reader::from_reader(BufReader::new(dec));
     reader.trim_text(true);
 
@@ -1266,22 +1284,80 @@ pub fn build_keyword_index(
     let mut last_sync = Instant::now();
     let mut ticker = ProgressTicker::new(&format!("build '{}'", keyword), total_members);
 
+    // OPT-03: memory-map the dump once and decompress + match members in
+    // parallel with rayon. Each worker gets a slice of the single shared
+    // mapping -- no per-member File::open/seek anymore.
+    //
+    // Resume-correctness: worker results are merged strictly in offset order
+    // below, so the resume watermark (max offset present in the .idx file)
+    // keeps its invariant -- every member at or below the watermark was fully
+    // processed. No completed-offset sidecar is needed.
+    //
+    // The mapping is read-only; the dump file must not be truncated mid-scan.
+    let map_file = File::open(dump_bz2_path)
+        .with_context(|| format!("opening dump for mmap: {}", dump_bz2_path))?;
+    // SAFETY: read-only mapping of a file we never write to.
+    let mmap = unsafe { memmap2::Mmap::map(&map_file)? };
+    let mmap_len = mmap.len() as u64;
+
+    struct MemberScan {
+        off: u64,
+        titles: Vec<String>, // matched titles, in page order within the member
+        pages: u64,
+        matches: u64,
+    }
+
     let mut canceled = false;
-    for off in offsets.drain(..) {
-        if let Some(flag) = cancel { if flag.load(Ordering::Relaxed) { canceled = true; break; } }
-        // Visit member; skip bad ones gracefully (e.g., bogus offsets)
-        if let Err(e) = visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
-            pages_scanned += 1;
-            if !keyword.is_empty() && kw_matcher.is_match(text) {
-                if existing.insert(title.to_string()) {
-                    // Update in-memory map; persistence handled by periodic save
-                    idx_map.insert(title.to_string(), off);
+    let mut scans: Vec<MemberScan> = offsets
+        .par_iter()
+        .map(|&off| {
+            if let Some(flag) = cancel {
+                if flag.load(Ordering::Relaxed) {
+                    return MemberScan { off, titles: Vec::new(), pages: 0, matches: 0 };
                 }
-                matches += 1;
-                if print_matches { println!("match: {} @ {}", title, off); }
             }
-        }, cancel) {
-            eprintln!("warning: skipping member @ {} due to error: {}", off, e);
+            let mut titles = Vec::new();
+            let mut pages = 0u64;
+            let mut matches = 0u64;
+            // Guard against bogus offsets (possible on the header-scan
+            // fallback path): slicing past EOF would panic, so warn-and-skip
+            // exactly like a failed member decompression.
+            let res = if off >= mmap_len {
+                Err(anyhow::anyhow!("offset {} past end of dump ({} bytes)", off, mmap_len))
+            } else {
+                visit_pages_in_member_reader(
+                    &mmap[off as usize..],
+                    off,
+                    |title, text, _pid| {
+                        pages += 1;
+                        if !keyword.is_empty() && kw_matcher.is_match(text) {
+                            titles.push(title.to_string());
+                            matches += 1;
+                        }
+                    },
+                    cancel,
+                )
+            };
+            // Visit member; skip bad ones gracefully (e.g., bogus offsets)
+            if let Err(e) = res {
+                eprintln!("warning: skipping member @ {} due to error: {}", off, e);
+            }
+            MemberScan { off, titles, pages, matches }
+        })
+        .collect();
+    // Deterministic in-order merge regardless of thread completion order.
+    scans.sort_by_key(|s| s.off);
+
+    for scan in scans {
+        if let Some(flag) = cancel { if flag.load(Ordering::Relaxed) { canceled = true; break; } }
+        pages_scanned += scan.pages;
+        matches += scan.matches;
+        for title in scan.titles {
+            if print_matches { println!("match: {} @ {}", title, scan.off); }
+            if existing.insert(title.clone()) {
+                // Update in-memory map; persistence handled by periodic save
+                idx_map.insert(title, scan.off);
+            }
         }
         processed_members += 1;
 
@@ -1298,7 +1374,6 @@ pub fn build_keyword_index(
             let _ = save_keyword_idx(&idx_map, &out_file);
             last_sync = Instant::now();
         }
-        if let Some(flag) = cancel { if flag.load(Ordering::Relaxed) { canceled = true; break; } }
     }
 
     // Final save to ensure checkpoint
