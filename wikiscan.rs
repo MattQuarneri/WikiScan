@@ -270,7 +270,11 @@ fn find_bzip2_member_offsets(dump_bz2_path: &str, cancel: Option<&Arc<AtomicBool
     let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB chunks
     let mut offsets = Vec::new();
     let mut file_pos: u64 = 0;
-    let mut carry: Vec<u8> = Vec::new();
+    // 3-byte carry so a "BZh9" header straddling a chunk boundary is found
+    // exactly once (its 'B' is only ever examined in the following chunk).
+    let mut carry = [0u8; 3];
+    let mut carry_len: usize = 0;
+    let mut tmp: Vec<u8> = Vec::new(); // reused scratch for carry + chunk
     let spinner = ["-","\\","|","/"];
     let mut spin_i = 0usize;
     let mut last_tick = Instant::now();
@@ -278,43 +282,43 @@ fn find_bzip2_member_offsets(dump_bz2_path: &str, cancel: Option<&Arc<AtomicBool
         if let Some(flag) = cancel { if flag.load(Ordering::Relaxed) { break; } }
         let n = f.read(&mut buf)?;
         if n == 0 { break; }
-        let slice = if carry.is_empty() { &buf[..n] } else {
-            // prepend carry to handle boundary matches
-            let mut tmp = Vec::with_capacity(carry.len() + n);
-            tmp.extend_from_slice(&carry);
+        // Scan window = carry bytes ++ new chunk; base_pos maps window
+        // indices back to absolute file offsets.
+        let (window, base_pos): (&[u8], u64) = if carry_len == 0 {
+            (&buf[..n], file_pos)
+        } else {
+            tmp.clear();
+            tmp.extend_from_slice(&carry[..carry_len]);
             tmp.extend_from_slice(&buf[..n]);
-            carry.clear();
-            let base_pos = file_pos.saturating_sub(tmp.len() as u64 - n as u64);
-            for i in 0..tmp.len().saturating_sub(3) {
-                // Stricter check: BZh followed by compression level '1'..='9'
-                if tmp[i] == b'B' && tmp[i+1] == b'Z' && tmp[i+2] == b'h' {
-                    let lvl = tmp[i+3];
-                    if (b'1'..=b'9').contains(&lvl) {
-                        offsets.push(base_pos + i as u64);
-                    }
-                }
-            }
-            if tmp.len() >= 3 { carry = tmp[tmp.len()-3..].to_vec(); } else { carry.clear(); }
-            file_pos += n as u64;
-            if last_tick.elapsed() >= Duration::from_secs(2) {
-                let s = spinner[spin_i % spinner.len()];
-                spin_i = spin_i.wrapping_add(1);
-                let pct = if total_bytes > 0 { (file_pos as f64) * 100.0 / (total_bytes as f64) } else { 0.0 };
-                eprint!("{} header-scan: {:.2}% of file (scannned {} blocks)\r", s, pct, offsets.len());
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-                last_tick = Instant::now();
-            }
-            continue;
+            (tmp.as_slice(), file_pos - carry_len as u64)
         };
-        for i in 0..slice.len().saturating_sub(3) {
-            if slice[i] == b'B' && slice[i+1] == b'Z' && slice[i+2] == b'h' {
-                let lvl = slice[i+3];
-                if (b'1'..=b'9').contains(&lvl) {
-                    offsets.push(file_pos + i as u64);
-                }
+        // OPT-04: SIMD jump straight to 'B' candidates instead of a per-byte
+        // loop. Only the 3 bytes after a candidate are inspected.
+        // Positions in the final 3 bytes are intentionally skipped here;
+        // they become next iteration's carry and are examined exactly once.
+        for i in memchr::memchr_iter(b'B', window) {
+            if i + 3 < window.len()
+                && window[i + 1] == b'Z'
+                && window[i + 2] == b'h'
+                && (b'1'..=b'9').contains(&window[i + 3])
+            {
+                offsets.push(base_pos + i as u64);
             }
         }
-        if slice.len() >= 3 { carry = slice[slice.len()-3..].to_vec(); } else { carry.clear(); }
+        // Keep the last 3 bytes as carry for the next chunk's boundary.
+        if n >= 3 {
+            carry.copy_from_slice(&buf[n - 3..n]);
+            carry_len = 3;
+        } else {
+            // Degenerate tiny read: keep the last <=3 bytes of carry ++ chunk.
+            let mut combined = [0u8; 6];
+            combined[..carry_len].copy_from_slice(&carry[..carry_len]);
+            combined[carry_len..carry_len + n].copy_from_slice(&buf[..n]);
+            let total = carry_len + n;
+            let keep = total.min(3);
+            carry[..keep].copy_from_slice(&combined[total - keep..total]);
+            carry_len = keep;
+        }
         file_pos += n as u64;
         if last_tick.elapsed() >= Duration::from_secs(2) {
             let s = spinner[spin_i % spinner.len()];
@@ -325,41 +329,15 @@ fn find_bzip2_member_offsets(dump_bz2_path: &str, cancel: Option<&Arc<AtomicBool
             last_tick = Instant::now();
         }
     }
-    eprintln!(); // Move to new line to prevent overwriting scan stats with validation stats
+    eprintln!();
     offsets.sort_unstable();
     offsets.dedup();
-    // Validate candidates by attempting a tiny decompression at each offset.
-    // This filters out false positives where "BZh" occurs in compressed data.
-    // We also show progress, since this phase can be long on very large dumps.
-    let mut valid = Vec::with_capacity(offsets.len());
-    let mut vfile = File::open(dump_bz2_path)
-        .with_context(|| format!("opening dump for header validation: {}", dump_bz2_path))?;
-    let mut last_tick_v = Instant::now();
-    let mut v_spin_i = 0usize;
-    for (i, &off) in offsets.iter().enumerate() {
-        if let Some(flag) = cancel { if flag.load(Ordering::Relaxed) { break; } }
-        vfile.seek(SeekFrom::Start(off))?;
-        // Limit validation read to avoid excessive I/O if offset is bogus.
-        // Using a 64 KiB cap is typically enough for bzip2 to emit a byte if the header is valid.
-        let limited = (&vfile).take(64 * 1024);
-        let mut test = BzDecoder::new(BufReader::new(limited));
-        let mut probe = [0u8; 1];
-        match test.read(&mut probe) {
-            Ok(0) => { /* invalid; skip */ }
-            Ok(_) => valid.push(off),
-            Err(_) => { /* invalid; skip */ }
-        }
-        if last_tick_v.elapsed() >= Duration::from_millis(500) {
-            let s = spinner[v_spin_i % spinner.len()];
-            v_spin_i = v_spin_i.wrapping_add(1);
-            let pct = if !offsets.is_empty() { (i as f64 + 1.0) * 100.0 / (offsets.len() as f64) } else { 100.0 };
-            eprint!("{} validating headers: {:.2}% (valid: {})\r", s, pct, valid.len());
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            last_tick_v = Instant::now();
-        }
-    }
-    eprintln!("");
-    Ok(valid)
+    // OPT-05: the old per-candidate validation pass (seek + 64 KiB probe
+    // decompression for every candidate) is deleted. Candidates are returned
+    // unvalidated; consumers already warn-and-skip members that fail to
+    // decompress, and a bogus offset fails fast on the bzip2 header -- roughly
+    // cost-neutral per bad offset while removing a full pass over the good ones.
+    Ok(offsets)
 }
 
 /// Build a keyword index in-memory (Title -> member offset) using the multistream index.
@@ -404,7 +382,9 @@ fn build_keyword_index_mem(
     let mut processed: u64 = 0;
     let mut ticker = ProgressTicker::new(&format!("scan members (mem idx '{}')", keyword), total_members);
     for off in offsets.drain(..) {
-        visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
+        // Warn-and-skip on bogus offsets (unvalidated header-scan candidates
+        // can fail to decompress); never abort the whole scan. (OPT-05)
+        if let Err(e) = visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
             pages_scanned += 1;
             if !keyword.is_empty() && kw_matcher.is_match(text) {
                 if !map.contains_key(title) {
@@ -412,7 +392,9 @@ fn build_keyword_index_mem(
                 }
                 matches += 1;
             }
-        }, None)?;
+        }, None) {
+            eprintln!("warning: skipping member @ {} due to error: {}", off, e);
+        }
         processed += 1;
         ticker.tick(processed, &format!("members:{} matches:{} pages:{}", processed, matches, pages_scanned));
     }
@@ -442,7 +424,9 @@ fn filter_index_with_keyword(
     let mut processed: u64 = 0;
     let mut ticker = ProgressTicker::new(&format!("filter '{}'", keyword), total_members);
     for off in offsets.drain(..) {
-        visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
+        // Warn-and-skip on bogus offsets (unvalidated header-scan candidates
+        // can fail to decompress); never abort the whole scan. (OPT-05)
+        if let Err(e) = visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
             // Only consider pages that were in the prior index
             if prior.contains_key(title) {
                 pages_scanned += 1;
@@ -451,7 +435,9 @@ fn filter_index_with_keyword(
                     matches += 1;
                 }
             }
-        }, None)?;
+        }, None) {
+            eprintln!("warning: skipping member @ {} due to error: {}", off, e);
+        }
         processed += 1;
         ticker.tick(processed, &format!("members:{} matched:{} pages:{}", processed, matches, pages_scanned));
     }
