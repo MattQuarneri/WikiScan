@@ -57,3 +57,6 @@ coverage/
 .nuxt/
 .svelte-kit/
 .vite/
+
+# OPT-00 generated fixture (recreate with: python3 bench/gen_fixture.py)
+bench/fixture.xml.bz2
