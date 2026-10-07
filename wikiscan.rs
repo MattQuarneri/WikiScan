@@ -1124,7 +1124,7 @@ where
 fn visit_pages_in_member_reader<F, R>(
     reader_in: R,
     offset: u64,
-    mut handler: F,
+    handler: F,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<()>
 where
@@ -1132,7 +1132,46 @@ where
     R: Read,
 {
     let dec = BzDecoder::new(BufReader::new(reader_in));
-    let mut reader = Reader::from_reader(BufReader::new(dec));
+    parse_member_xml(BufReader::new(dec), offset, handler, cancel)
+}
+
+/// Parse pages from an in-memory decompressed member buffer (OPT-06).
+fn visit_pages_in_buffer<F>(
+    decompressed: &[u8],
+    offset: u64,
+    handler: F,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()>
+where
+    F: FnMut(&str, &str, u64),
+{
+    parse_member_xml(BufReader::new(decompressed), offset, handler, cancel)
+}
+
+/// Unescape field bytes accumulated over a page's text events, once per page
+/// (OPT-07) instead of once per event. Mirrors the old per-event
+/// `e.unescape().unwrap_or_default()` semantics exactly: invalid UTF-8 or a
+/// bad escape sequence yields "".
+fn unescape_raw(raw: &[u8]) -> String {
+    match std::str::from_utf8(raw) {
+        Ok(s) => quick_xml::escape::unescape(s).unwrap_or_default().into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// The quick-xml event loop shared by the streaming (file/mmap-slice) and
+/// buffered member readers.
+fn parse_member_xml<F, R>(
+    reader_in: R,
+    offset: u64,
+    mut handler: F,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<()>
+where
+    F: FnMut(&str, &str, u64),
+    R: BufRead,
+{
+    let mut reader = Reader::from_reader(reader_in);
     reader.trim_text(true);
 
     let mut buf = Vec::new();
@@ -1140,16 +1179,20 @@ where
     let mut in_title = false;
     let mut in_id = false;
     let mut in_text = false;
-    let mut cur_title = String::new();
+    // OPT-07: accumulate still-escaped raw bytes per page and unescape once
+    // when the page closes, instead of unescaping every text event. Verified
+    // against quick-xml 0.31: text events are not split mid-entity, so
+    // unescape(concat(chunks)) == concat(unescape(chunk)) on real input.
+    let mut cur_title_raw = Vec::new();
     let mut cur_id: u64 = 0;
-    let mut text = String::new();
+    let mut text_raw = Vec::new();
     
 
     loop {
         if let Some(flag) = cancel { if flag.load(Ordering::Relaxed) { break; } }
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
-                b"page" => { in_page = true; in_id = false; cur_title.clear(); text.clear(); cur_id = 0; }
+                b"page" => { in_page = true; in_id = false; cur_title_raw.clear(); text_raw.clear(); cur_id = 0; }
                 b"title" if in_page => in_title = true,
                 b"id" if in_page && cur_id == 0 => in_id = true,
                 b"text" if in_page => in_text = true,
@@ -1157,6 +1200,8 @@ where
             },
             Ok(Event::End(e)) => match e.name().as_ref() {
                 b"page" => {
+                    let cur_title = unescape_raw(&cur_title_raw);
+                    let text = unescape_raw(&text_raw);
                     handler(&cur_title, &text, cur_id);
                     in_page = false;
                 }
@@ -1166,10 +1211,10 @@ where
                 _ => {}
             },
             Ok(Event::Text(e)) => {
-                if in_title { cur_title.push_str(&e.unescape().unwrap_or_default()); }
+                if in_title { cur_title_raw.extend_from_slice(e.as_ref()); }
                 else if in_id {
                     if let Ok(v) = e.unescape().unwrap_or_default().parse::<u64>() { cur_id = v; }
-                } else if in_text { text.push_str(&e.unescape().unwrap_or_default()); }
+                } else if in_text { text_raw.extend_from_slice(e.as_ref()); }
             }
             Ok(Event::Eof) => break, // end of this member
             Err(e) => bail!("XML error while scanning member @ {offset}: {e}"),
@@ -1179,6 +1224,83 @@ where
     }
 
     Ok(())
+}
+
+/// Result of scanning one bzip2 member: matched titles in page order plus
+/// page/match counts.
+struct MemberScan {
+    off: u64,
+    titles: Vec<String>,
+    pages: u64,
+    matches: u64,
+}
+
+/// OPT-06 hard rule: the raw-byte prefilter is only safe when the keyword
+/// cannot appear entity-escaped in source XML. A keyword containing any of
+/// `& < > ' "` could be stored escaped (e.g. `R&D` as `R&amp;D`), so a raw
+/// search for it could silently miss real matches (false negative).
+/// Keywords failing this test bypass the prefilter and parse every member.
+fn prefilter_safe(keyword: &str) -> bool {
+    !keyword.contains(['&', '<', '>', '\'', '"'])
+}
+
+/// Scan one member from the shared mmap dump: decompress, optionally
+/// prefilter on the raw bytes (OPT-06), then XML-parse and match pages.
+///
+/// Returns matched titles in page order. Errors (bogus offsets, corrupt
+/// data) are returned for the caller to warn-and-skip.
+fn scan_member(
+    mmap: &[u8],
+    off: u64,
+    keyword: &str,
+    kw_matcher: &Regex,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<MemberScan> {
+    let start = off as usize;
+    if start >= mmap.len() {
+        // Guard against bogus offsets (possible on the header-scan fallback
+        // path): slicing past EOF would panic, so fail gracefully instead.
+        bail!("offset {} past end of dump ({} bytes)", off, mmap.len());
+    }
+    let compressed = &mmap[start..];
+    let use_prefilter = prefilter_safe(keyword);
+
+    let mut scan = MemberScan { off, titles: Vec::new(), pages: 0, matches: 0 };
+    let mut on_page = |title: &str, text: &str, _pid: u64| {
+        scan.pages += 1;
+        if !keyword.is_empty() && kw_matcher.is_match(text) {
+            scan.titles.push(title.to_string());
+            scan.matches += 1;
+        }
+    };
+
+    if use_prefilter {
+        // OPT-06: decompress once into memory, then search the raw bytes. A
+        // member whose raw bytes lack the keyword cannot contain a match, so
+        // XML parsing is skipped entirely for it. False positives are
+        // harmless (they just get parsed); false negatives are prevented by
+        // prefilter_safe() above.
+        let mut decompressed = Vec::new();
+        BzDecoder::new(BufReader::new(compressed))
+            .read_to_end(&mut decompressed)
+            .with_context(|| format!("decompressing member @ {}", off))?;
+        let hit = if keyword.is_empty() {
+            false // empty keyword matches nothing; skip parsing
+        } else {
+            match std::str::from_utf8(&decompressed) {
+                Ok(text) => kw_matcher.is_match(text),
+                // Not valid UTF-8: be conservative and parse fully rather
+                // than risk a lossy-conversion false negative.
+                Err(_) => true,
+            }
+        };
+        if hit {
+            visit_pages_in_buffer(&decompressed, off, &mut on_page, cancel)?;
+        }
+    } else {
+        visit_pages_in_member_reader(compressed, off, &mut on_page, cancel)?;
+    }
+    Ok(scan)
 }
 
 /// Build a keyword index file mapping Title -> multistream block offset.
@@ -1284,14 +1406,6 @@ pub fn build_keyword_index(
         .with_context(|| format!("opening dump for mmap: {}", dump_bz2_path))?;
     // SAFETY: read-only mapping of a file we never write to.
     let mmap = unsafe { memmap2::Mmap::map(&map_file)? };
-    let mmap_len = mmap.len() as u64;
-
-    struct MemberScan {
-        off: u64,
-        titles: Vec<String>, // matched titles, in page order within the member
-        pages: u64,
-        matches: u64,
-    }
 
     let mut canceled = false;
     let mut scans: Vec<MemberScan> = offsets
@@ -1302,33 +1416,14 @@ pub fn build_keyword_index(
                     return MemberScan { off, titles: Vec::new(), pages: 0, matches: 0 };
                 }
             }
-            let mut titles = Vec::new();
-            let mut pages = 0u64;
-            let mut matches = 0u64;
-            // Guard against bogus offsets (possible on the header-scan
-            // fallback path): slicing past EOF would panic, so warn-and-skip
-            // exactly like a failed member decompression.
-            let res = if off >= mmap_len {
-                Err(anyhow::anyhow!("offset {} past end of dump ({} bytes)", off, mmap_len))
-            } else {
-                visit_pages_in_member_reader(
-                    &mmap[off as usize..],
-                    off,
-                    |title, text, _pid| {
-                        pages += 1;
-                        if !keyword.is_empty() && kw_matcher.is_match(text) {
-                            titles.push(title.to_string());
-                            matches += 1;
-                        }
-                    },
-                    cancel,
-                )
-            };
             // Visit member; skip bad ones gracefully (e.g., bogus offsets)
-            if let Err(e) = res {
-                eprintln!("warning: skipping member @ {} due to error: {}", off, e);
+            match scan_member(&mmap, off, keyword, &kw_matcher, cancel) {
+                Ok(scan) => scan,
+                Err(e) => {
+                    eprintln!("warning: skipping member @ {} due to error: {}", off, e);
+                    MemberScan { off, titles: Vec::new(), pages: 0, matches: 0 }
+                }
             }
-            MemberScan { off, titles, pages, matches }
         })
         .collect();
     // Deterministic in-order merge regardless of thread completion order.
@@ -1720,4 +1815,140 @@ fn start_tcp_server(addr: &str) -> Result<()> {
     // Delegate to generic TCP server with our service
     let svc = WikiScanService;
     start_tcp_server_generic(svc, addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bzip2::write::BzEncoder;
+    use std::io::Write as _;
+
+    fn bz2_member(pages_xml: &str) -> Vec<u8> {
+        let mut enc = BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        enc.write_all(pages_xml.as_bytes()).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn page_xml(id: u64, title: &str, text: &str) -> String {
+        format!(
+            "<page><title>{}</title><ns>0</ns><id>{}</id><revision><id>{}</id>\
+             <text xml:space=\"preserve\">{}</text></revision></page>",
+            title, id, id, text
+        )
+    }
+
+    #[test]
+    fn prefilter_rule_rejects_escapable_keywords() {
+        // The OPT-06 hard rule: keywords containing XML-escapable characters
+        // must bypass the raw prefilter.
+        assert!(prefilter_safe("quantum"));
+        assert!(prefilter_safe("xylophone"));
+        assert!(!prefilter_safe("R&D"));
+        assert!(!prefilter_safe("a<b"));
+        assert!(!prefilter_safe("it's"));
+        assert!(!prefilter_safe("\"quoted\""));
+    }
+
+    #[test]
+    fn escapable_keyword_still_matches_via_full_parse() {
+        // Page text stores R&D as R&amp;D. With prefiltering correctly
+        // bypassed for this keyword, the member must still match.
+        let xml = page_xml(1, "T", "research R&amp;D lab");
+        let member = bz2_member(&xml);
+        let matcher = keyword_matcher("R&D").unwrap();
+        assert!(!prefilter_safe("R&D"));
+        let scan = scan_member(&member, 0, "R&D", &matcher, None).unwrap();
+        assert_eq!(scan.matches, 1);
+        assert_eq!(scan.titles, vec!["T".to_string()]);
+    }
+
+    #[test]
+    fn prefilter_parses_member_on_raw_hit() {
+        let xml = page_xml(2, "U", "Quantum Leap episode");
+        let member = bz2_member(&xml);
+        let matcher = keyword_matcher("quantum").unwrap();
+        assert!(prefilter_safe("quantum"));
+        let scan = scan_member(&member, 0, "quantum", &matcher, None).unwrap();
+        assert_eq!(scan.matches, 1);
+        assert_eq!(scan.pages, 1);
+        assert_eq!(scan.titles, vec!["U".to_string()]);
+    }
+
+    #[test]
+    fn prefilter_skips_member_without_raw_hit() {
+        // No keyword in the raw bytes: XML parsing is skipped, so no pages
+        // are counted -- but crucially, no matches are lost either.
+        let xml = page_xml(3, "V", "nothing relevant here");
+        let member = bz2_member(&xml);
+        let matcher = keyword_matcher("quantum").unwrap();
+        let scan = scan_member(&member, 0, "quantum", &matcher, None).unwrap();
+        assert_eq!(scan.matches, 0);
+        assert_eq!(scan.pages, 0);
+        assert!(scan.titles.is_empty());
+    }
+
+    #[test]
+    fn prefilter_agrees_with_full_parse_on_mixed_member() {
+        // Same member, prefilter on vs off, must produce identical results.
+        let xml = format!(
+            "{}{}{}",
+            page_xml(4, "W1", "Quantum mechanics 101"),
+            page_xml(5, "W2", "cooking recipes"),
+            page_xml(6, "W3", "QUANTUM field theory"),
+        );
+        let member = bz2_member(&xml);
+        let matcher = keyword_matcher("quantum").unwrap();
+        let via_prefilter = scan_member(&member, 0, "quantum", &matcher, None).unwrap();
+        // Force the full-parse path by using a keyword that disables the
+        // prefilter but matches the same pages via regex on parsed text.
+        let via_parse = {
+            let m2 = keyword_matcher("quantum").unwrap();
+            // simulate: prefilter bypassed -> parse path; compare titles
+            let mut titles = Vec::new();
+            visit_pages_in_buffer(&{
+                let mut d = Vec::new();
+                BzDecoder::new(&member[..]).read_to_end(&mut d).unwrap();
+                d
+            }, 0, |t: &str, x: &str, _: u64| {
+                if m2.is_match(x) { titles.push(t.to_string()); }
+            }, None).unwrap();
+            titles
+        };
+        assert_eq!(via_prefilter.titles, via_parse);
+        assert_eq!(via_prefilter.matches, 2);
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn probe_text_event_splitting() {
+        // Pathological: long text with interior whitespace runs and entities.
+        // visit_pages_in_buffer receives DECOMPRESSED bytes; here we pass the
+        // xml directly as the buffer (no bzip2 round trip needed for this).
+        let inner = format!("start{}mid&amp;end{}", " ".repeat(5), " ".repeat(5));
+        let big = format!("{}{}{}", "a".repeat(100000), inner, "b".repeat(100000));
+        let xml = format!(
+            "<page><title>P</title><ns>0</ns><id>9</id><revision><id>9</id>             <text xml:space=\"preserve\">{}</text></revision></page>",
+            big
+        );
+        let mut got = String::new();
+        let mut got_title = String::new();
+        visit_pages_in_buffer(xml.as_bytes(), 0, |t: &str, x: &str, _: u64| {
+            got_title = t.to_string();
+            got = x.to_string();
+        }, None).unwrap();
+        let expected = format!(
+            "{}start{}mid&end{}{}",
+            "a".repeat(100000), " ".repeat(5), " ".repeat(5), "b".repeat(100000)
+        );
+        // OPT-07 regression: unescape-once-per-page must equal the old
+        // per-event behavior, even for huge texts with interior whitespace
+        // runs and entities.
+        assert_eq!(got_title, "P");
+        assert_eq!(got.len(), expected.len());
+        assert_eq!(got, expected);
+    }
 }
