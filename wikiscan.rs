@@ -1266,12 +1266,16 @@ pub fn build_keyword_index(
         }
         processed_members += 1;
 
-        // Periodic progress + checkpoint
+        // Periodic progress + checkpoint.
+        // NOTE (OPT-01): the index used to be rewritten to disk on EVERY member
+        // iteration here, an O(members * matches) cost that dwarfed the scan
+        // itself. Checkpoints now happen on a 15 s timer or every 50 members,
+        // plus on cancel/completion. A crash loses at most that window of work;
+        // the existing resume logic (skip members <= max offset in the .idx)
+        // already tolerates partial checkpoints.
         ticker.tick(processed_members, &format!("members:{} matches:{} pages:{}", processed_members, matches, pages_scanned));
-        // Persist checkpoint to disk to survive crashes or restarts
-        let _ = save_keyword_idx(&idx_map, &out_file);
         // Periodic durable sync
-        if last_sync.elapsed() >= Duration::from_secs(15) {
+        if last_sync.elapsed() >= Duration::from_secs(15) || processed_members % 50 == 0 {
             let _ = save_keyword_idx(&idx_map, &out_file);
             last_sync = Instant::now();
         }
