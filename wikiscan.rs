@@ -241,6 +241,25 @@ fn validate_dump_readable(dump_bz2_path: &str) -> Result<usize> {
     Ok(n)
 }
 
+/// Compile a literal, case-insensitive keyword matcher once per scan.
+///
+/// This replaces the old `text.to_lowercase().contains(&kw_lower)` hot path,
+/// which allocated a full lowercased copy of every page's text. The compiled
+/// regex searches in place with no per-page allocation.
+///
+/// Matching semantics (OPT-02): the pattern is literal (`regex::escape`) with
+/// Unicode *simple* case folding (`case_insensitive`). For ASCII keywords this
+/// is exactly equivalent to the old lowercase-then-contains; exotic Unicode
+/// case pairs (e.g. full-vs-simple folding differences like Turkish dotted İ)
+/// may differ in rare cases. Callers must keep the `!keyword.is_empty()`
+/// guard: an empty pattern would match everything.
+fn keyword_matcher(keyword: &str) -> Result<Regex> {
+    regex::RegexBuilder::new(&regex::escape(keyword))
+        .case_insensitive(true)
+        .build()
+        .with_context(|| format!("compiling keyword matcher for {:?}", keyword))
+}
+
 /// Heuristic: scan the compressed dump file for bzip2 member headers ("BZh")
 /// to infer candidate member start offsets when a multistream index is absent.
 fn find_bzip2_member_offsets(dump_bz2_path: &str, cancel: Option<&Arc<AtomicBool>>) -> Result<Vec<u64>> {
@@ -374,7 +393,7 @@ fn build_keyword_index_mem(
             v
         }
     };
-    let kw_lower = keyword.to_lowercase();
+    let kw_matcher = keyword_matcher(keyword)?;
 
     // Progress ticker
     let mut map: HashMap<String, u64> = HashMap::new();
@@ -386,7 +405,7 @@ fn build_keyword_index_mem(
     for off in offsets.drain(..) {
         visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
             pages_scanned += 1;
-            if !kw_lower.is_empty() && text.to_lowercase().contains(&kw_lower) {
+            if !keyword.is_empty() && kw_matcher.is_match(text) {
                 if !map.contains_key(title) {
                     map.insert(title.to_string(), off);
                 }
@@ -406,7 +425,7 @@ fn filter_index_with_keyword(
     prior: &HashMap<String, u64>,
     keyword: &str,
 ) -> Result<(HashMap<String, u64>, u64, u64)> {
-    let kw_lower = keyword.to_lowercase();
+    let kw_matcher = keyword_matcher(keyword)?;
     let mut out: HashMap<String, u64> = HashMap::new();
     // Unique member offsets to visit
     let mut offsets: Vec<u64> = {
@@ -426,7 +445,7 @@ fn filter_index_with_keyword(
             // Only consider pages that were in the prior index
             if prior.contains_key(title) {
                 pages_scanned += 1;
-                if text.to_lowercase().contains(&kw_lower) {
+                if kw_matcher.is_match(text) {
                     if !out.contains_key(title) { out.insert(title.to_string(), off); }
                     matches += 1;
                 }
@@ -845,7 +864,7 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
             
             let scan_queue = &member_offsets[start_index..];
             
-            let kw_lower = keyword.to_lowercase();
+            let kw_matcher = keyword_matcher(&keyword)?;
             let mut matches_found_session = 0;
             let mut matches_total = existing_list.len();
             
@@ -871,7 +890,7 @@ fn run_repl<R: BufRead, W: Write>(mut stdin: R, mut out: W, enable_colors: bool)
                 
                 let mut member_matches = Vec::new();
                 let res = visit_pages_in_member(dump, off, |title, text, _pid| {
-                    if !kw_lower.is_empty() && text.to_lowercase().contains(&kw_lower) {
+                    if !keyword.is_empty() && kw_matcher.is_match(text) {
                          if !existing_set.contains(title) {
                              member_matches.push((title.to_string(), off));
                              // If this is the one we want, Capture it!
@@ -1227,7 +1246,7 @@ pub fn build_keyword_index(
     let mut existing: HashSet<String> = idx_map.keys().cloned().collect();
     let mut existing_max_off: u64 = idx_map.values().copied().max().unwrap_or(0);
 
-    let kw_lower = keyword.to_lowercase();
+    let kw_matcher = keyword_matcher(keyword)?;
     let mut pages_scanned: u64 = 0;
     let mut matches: u64 = 0;
 
@@ -1253,7 +1272,7 @@ pub fn build_keyword_index(
         // Visit member; skip bad ones gracefully (e.g., bogus offsets)
         if let Err(e) = visit_pages_in_member(dump_bz2_path, off, |title, text, _pid| {
             pages_scanned += 1;
-            if !kw_lower.is_empty() && text.to_lowercase().contains(&kw_lower) {
+            if !keyword.is_empty() && kw_matcher.is_match(text) {
                 if existing.insert(title.to_string()) {
                     // Update in-memory map; persistence handled by periodic save
                     idx_map.insert(title.to_string(), off);
@@ -1440,7 +1459,7 @@ pub fn scan_dump_for_keyword(dump_bz2_path: &str, keyword: &str, print_matches: 
     let mut reader = Reader::from_reader(BufReader::new(dec_counted));
     reader.trim_text(true);
 
-    let kw_lower = keyword.to_lowercase();
+    let kw_matcher = keyword_matcher(keyword)?;
 
     let mut buf = Vec::new();
     let mut in_page = false;
@@ -1518,9 +1537,9 @@ pub fn scan_dump_for_keyword(dump_bz2_path: &str, keyword: &str, print_matches: 
                 match e.name().as_ref() {
                     b"page" => {
                         page_count += 1;
-                        // Case-insensitive contains on page text
-                        if !kw_lower.is_empty() {
-                            if text.to_lowercase().contains(&kw_lower) {
+                        // Case-insensitive literal match on page text (OPT-02: no per-page allocation)
+                        if !keyword.is_empty() {
+                            if kw_matcher.is_match(&text) {
                                 match_count += 1;
                                 if print_matches { println!("match: {}", cur_title); }
                             }
